@@ -1,0 +1,7 @@
+*.jpg
+__pycache__/
+*.pt
+*.pth
+*.pt
+*.pth
+# Git에 업로드하지 않을 파일 목록
