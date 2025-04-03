@@ -1,124 +1,139 @@
+import os
+import random
+from PIL import Image
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import os
-from PIL import Image
-from tqdm import tqdm  # 🔹 tqdm 라이브러리 추가 (진행률 표시)
 
-# 🔹 Depthwise Separable Convolution 정의
+# ------------------------------
+# 모델 정의
+# ------------------------------
 class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, 
-                                   stride=stride, padding=kernel_size//2, groups=in_channels, bias=False)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU6(inplace=True)
-    
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        return self.relu(x)
-
-# 🔹 Inverted Residual Block (IRB) 정의
-class InvertedResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, expansion=6):
-        super().__init__()
-        hidden_dim = in_channels * expansion
-        self.use_residual = in_channels == out_channels
-        
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU6(inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, stride, 1, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.Hardswish(inplace=True),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.Hardswish(inplace=True)
+        )
 
-            DepthwiseSeparableConv(hidden_dim, hidden_dim, stride=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU6(inplace=True),
+    def forward(self, x):
+        return self.block(x)
 
-            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False),
+class InvertedResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, expansion=4):
+        super().__init__()
+        hidden = in_channels * expansion
+        self.use_res = in_channels == out_channels
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.Hardswish(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.Hardswish(inplace=True),
+            nn.Conv2d(hidden, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels)
         )
-    
-    def forward(self, x):
-        if self.use_residual:
-            return x + self.block(x)  # Skip Connection 적용
-        else:
-            return self.block(x)
 
-# 🔹 네트워크 정의
-class Lip3DLandmarkNet(nn.Module):
+    def forward(self, x):
+        return x + self.block(x) if self.use_res else self.block(x)
+
+class Lip3DLandmarkLite128Net(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # 초기 다운샘플링 단계
-        self.conv1 = DepthwiseSeparableConv(3, 16, stride=2)  # 256 → 128
-        self.conv2 = DepthwiseSeparableConv(16, 32, stride=2) # 128 → 64
-        self.conv3 = DepthwiseSeparableConv(32, 64, stride=2) # 64 → 32
-        self.conv4 = DepthwiseSeparableConv(64, 128, stride=2) # 32 → 16
-
-        # IRB 블록 6개 적용
-        self.irb1 = InvertedResidualBlock(128, 128)
-        self.irb2 = InvertedResidualBlock(128, 128)
-        self.irb3 = InvertedResidualBlock(128, 128)
-        self.irb4 = InvertedResidualBlock(128, 256)
-        self.irb5 = InvertedResidualBlock(256, 256)
-        self.irb6 = InvertedResidualBlock(256, 256)
-
-        # Global Average Pooling & FC Layer
-        self.global_pool = nn.AdaptiveAvgPool2d(1)  # (B, C, H, W) → (B, C, 1, 1)
-        self.fc = nn.Linear(256, 120)  # 40개의 (x, y, z) 좌표를 출력
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 16, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True),
+            DepthwiseSeparableConv(16, 32, stride=2),
+        )
+        self.irbs = nn.Sequential(
+            InvertedResidualBlock(32, 64, expansion=2),
+            InvertedResidualBlock(64, 64, expansion=2),
+            InvertedResidualBlock(64, 96, expansion=3),
+            InvertedResidualBlock(96, 96, expansion=3),
+            InvertedResidualBlock(96, 128, expansion=4),
+            InvertedResidualBlock(128, 128, expansion=4),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, 60 * 3)
+        )
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
+        x = self.stem(x)
+        x = self.irbs(x)
+        x = self.head(x)
+        return x.view(-1, 60, 3)
 
-        x = self.irb1(x)
-        x = self.irb2(x)
-        x = self.irb3(x)
-        x = self.irb4(x)
-        x = self.irb5(x)
-        x = self.irb6(x)
+# ------------------------------
+# Loss 함수 (Z축 가중치 포함)
+# ------------------------------
+class WeightedWingLoss(nn.Module):
+    def __init__(self, w=10.0, epsilon=2.0, z_weight=5.0):
+        super().__init__()
+        self.w = w
+        self.epsilon = epsilon
+        self.C = w - w * torch.log(torch.tensor(1 + w / epsilon))
+        self.z_weight = z_weight
 
-        x = self.global_pool(x)
-        x = torch.flatten(x, 1)  # (B, 256, 1, 1) → (B, 256)
-        x = self.fc(x)  # (B, 120)
+    def forward(self, pred, target):
+        diff = pred - target
+        abs_diff = torch.abs(diff)
+        loss = torch.where(
+            abs_diff < self.w,
+            self.w * torch.log(1 + abs_diff / self.epsilon),
+            abs_diff - self.C.to(abs_diff.device)
+        )
+        loss[:, :, 2] *= self.z_weight  # z 가중치 적용
+        return loss.mean()
 
-        return x.view(-1, 40, 3)  # (B, 40, 3) 형태로 변환 (x, y, z)
-
+# ------------------------------
+# 데이터셋 정의
+# ------------------------------
 class Lip3DLandmarkDataset(Dataset):
     def __init__(self, data_dir, transform=None):
         self.data_dir = data_dir
         self.transform = transform
-
-        # 🔸 .pt 파일 불러오기
-        self.data_list = torch.load(os.path.join(data_dir, "lips_3d_landmarks.pt"))
+        self.data_list = torch.load(os.path.join(data_dir, "lips_3d_landmarks_60.pt"))
 
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
-        # 3개의 값이 저장된 경우 → (이미지 경로, 랜드마크, 원본 크기)
-        img_path, landmarks, _ = self.data_list[idx]  # 원본 크기 (_) 무시
+        max_tries = 10
+        for _ in range(max_tries):
+            img_path, landmarks = self.data_list[idx]
+            full_path = os.path.join(self.data_dir, img_path)
+            if os.path.exists(full_path):
+                img = Image.open(full_path).convert("RGB")
+                if self.transform:
+                    img = self.transform(img)
 
-        img = Image.open(os.path.join(self.data_dir, img_path)).convert("RGB")
+                landmarks = torch.tensor(landmarks, dtype=torch.float32)
+                landmarks[:, :2] = landmarks[:, :2] / 2.0  # x,y 정규화 (128 기준)
+                z = landmarks[:, 2]
+                z -= z.mean()             # 중심 정렬
+                z *= 100.0                # 스케일 확대
+                landmarks[:, 2] = z
+                return img, landmarks
+            idx = random.randint(0, len(self.data_list) - 1)
+        raise FileNotFoundError("유효한 이미지를 찾을 수 없습니다.")
 
-        if self.transform:
-            img = self.transform(img)
-
-        # 🔹 3D 랜드마크 좌표를 Tensor로 변환
-        landmarks = torch.tensor(landmarks, dtype=torch.float32)  # (40, 3)
-
-        return img, landmarks
-    
-# 🔹 학습 루프 (최적의 모델 저장 & 진행률 표시)
+# ------------------------------
+# 학습 루프
+# ------------------------------
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50):
-    best_val_loss = float('inf')  # 초기 최적 검증 손실 설정
+    best_val_loss = float('inf')
     model.train()
 
     for epoch in range(num_epochs):
@@ -126,68 +141,56 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_loader_tqdm = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Training", leave=False)
 
         for batch_idx, (images, landmarks) in enumerate(train_loader_tqdm):
-            images, landmarks = images.to(device, non_blocking=True), landmarks.to(device, non_blocking=True)
-
+            images, landmarks = images.to(device), landmarks.to(device)
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, landmarks)
             loss.backward()
             optimizer.step()
-
             running_loss += loss.item()
 
-            # 🔹 10개 배치마다 평균 손실 출력
             if batch_idx % 10 == 0:
                 avg_loss = running_loss / (batch_idx + 1)
                 train_loader_tqdm.set_postfix(loss=avg_loss)
 
-        # 🔹 검증 단계 (진행률 표시)
         model.eval()
         val_loss = 0.0
-        val_loader_tqdm = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Validation", leave=False)
-
         with torch.no_grad():
-            for images, landmarks in val_loader_tqdm:
-                images, landmarks = images.to(device, non_blocking=True), landmarks.to(device, non_blocking=True)
+            for images, landmarks in tqdm(val_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Validation", leave=False):
+                images, landmarks = images.to(device), landmarks.to(device)
                 outputs = model(images)
                 val_loss += criterion(outputs, landmarks).item()
-
         val_loss /= len(val_loader)
 
-        # 🔹 에포크별 손실 출력
         print(f"\n✅ Epoch [{epoch+1}/{num_epochs}] - Train Loss: {running_loss/len(train_loader):.6f}, Val Loss: {val_loss:.6f}")
 
-        # 🔹 최적의 모델 저장 (검증 손실이 줄어들 때만 저장)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_lip_3d_landmark_model.pth")
-            print(f"✅ 새로운 최적 모델 저장: best_lip_3d_landmark_model.pth (Val Loss: {best_val_loss:.6f})")
+            torch.save(model.state_dict(), "best_lip_3d_landmark_model3.pth")
+            print(f"✅ 최적 모델 저장됨 (Val Loss: {best_val_loss:.6f})")
 
         model.train()
 
-    print("✅ 최종 학습 완료!")
-
-# 🔹 실행 코드
+# ------------------------------
+# 실행부
+# ------------------------------
 if __name__ == '__main__':
-    # 🔹 데이터 로딩
-    data_dir = r"C:\Users\User\Desktop\Lips_Landmark"
+    data_dir = r"C:\\Users\\User\\Desktop\\Lips_Landmark"
     transform = transforms.Compose([
-        transforms.Resize((256, 256)),
+        transforms.Resize((128, 128)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
     ])
 
-    train_dataset = Lip3DLandmarkDataset(data_dir=data_dir, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
+    train_dataset = Lip3DLandmarkDataset(data_dir, transform)
+    val_dataset = Lip3DLandmarkDataset(data_dir, transform)
 
-    val_dataset = Lip3DLandmarkDataset(data_dir=data_dir, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
 
-    # 🔹 모델 및 학습 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Lip3DLandmarkNet().to(device)
-    criterion = nn.SmoothL1Loss().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    model = Lip3DLandmarkLite128Net().to(device)
+    criterion = WeightedWingLoss(w=10.0, epsilon=2.0, z_weight=5.0).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
-    # 🔹 모델 학습 실행
     train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50)
